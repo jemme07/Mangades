@@ -26,6 +26,7 @@ Options:
   --format <cbz|pdf>             Output format (default: cbz)
   --split <volume|chapter|single> How to split files (default: volume)
   --lang <code>                  Chapter language (default: en)
+  --fallback-lang <code>         Fallback language for missing chapters
   --out <dir>                    Output directory (default: ./downloads)
   -h, --help                     Show this help message`);
 }
@@ -35,6 +36,7 @@ function parseArgs(argv) {
   let format = "cbz";
   let split = "volume";
   let lang;
+  let fallbackLang;
   let outBase;
 
   for (let i = 0; i < argv.length; i++) {
@@ -48,6 +50,8 @@ function parseArgs(argv) {
       split = argv[++i]?.toLowerCase();
     } else if (arg === "--lang") {
       lang = argv[++i];
+    } else if (arg === "--fallback-lang") {
+      fallbackLang = argv[++i];
     } else if (arg === "--out") {
       outBase = argv[++i];
     } else if (arg.startsWith("-")) {
@@ -72,7 +76,7 @@ function parseArgs(argv) {
     throw new Error(`Invalid --split "${split}". Expected: volume, chapter, single`);
   }
 
-  return { mangaId, lang, outBase, format, split };
+  return { mangaId, lang, fallbackLang, outBase, format, split };
 }
 
 async function fetchWithRetry(url, retries = 6, baseDelay = 1000) {
@@ -212,7 +216,8 @@ async function iterChapterImages(chapters, onImage) {
 
     const chNum = String(ch.attributes.chapter || "0").padStart(chPad, "0");
     const chTitle = ch.attributes.title ? ` - ${sanitize(ch.attributes.title)}` : "";
-    const chDir = `ch ${chNum}${chTitle}`;
+    const langTag = ch._fallbackLang ? ` [${ch._fallbackLang}]` : "";
+    const chDir = `ch ${chNum}${chTitle}${langTag}`;
     const pagePad = String(files.length).length;
 
     for (let i = 0; i < files.length; i++) {
@@ -308,19 +313,36 @@ async function writePdf({ chapters, coverUrl, outFile }) {
 }
 
 async function main() {
-  const { mangaId, lang, outBase, format, split } = parseArgs(process.argv.slice(2));
+  const { mangaId, lang, fallbackLang, outBase, format, split } = parseArgs(process.argv.slice(2));
 
-  console.log(`Fetching manga ${mangaId} (${lang}, format=${format}, split=${split})...`);
+  console.log(`Fetching manga ${mangaId} (${lang}${fallbackLang ? `, fallback=${fallbackLang}` : ""}, format=${format}, split=${split})...`);
   const { title } = await getMangaInfo(mangaId, lang);
   const outDir = path.join(outBase, title);
   fs.mkdirSync(outDir, { recursive: true });
   console.log(`Title: ${title}`);
   console.log(`Output: ${outDir}`);
 
-  const [covers, chapters] = await Promise.all([
+  const [covers, primaryChapters, fallbackChapters] = await Promise.all([
     getCovers(mangaId),
     getAllChapters(mangaId, lang),
+    fallbackLang ? getAllChapters(mangaId, fallbackLang) : Promise.resolve([]),
   ]);
+
+  const chapters = [...primaryChapters];
+  if (fallbackLang && fallbackChapters.length > 0) {
+    const seen = new Set(primaryChapters.map((c) => String(c.attributes.chapter)));
+    let added = 0;
+    for (const ch of fallbackChapters) {
+      const chNum = String(ch.attributes.chapter);
+      if (!seen.has(chNum)) {
+        seen.add(chNum);
+        ch._fallbackLang = fallbackLang;
+        chapters.push(ch);
+        added++;
+      }
+    }
+    if (added > 0) console.log(`Filled ${added} missing chapter(s) from ${fallbackLang}.`);
+  }
   console.log(`Found ${chapters.length} downloadable chapters and ${covers.size} covers.`);
 
   const groups = groupChapters(chapters, split, covers);

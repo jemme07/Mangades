@@ -19,6 +19,7 @@ npm run download -- <mangadex-url-or-id> [lang] [output-dir] [options]
 - `--format <cbz|pdf>` — Output format (default: `cbz`)
 - `--split <volume|chapter|single>` — How to split files (default: `volume`)
 - `--lang <code>` — Chapter language (default: `en`)
+- `--fallback-lang <code>` — Fallback language for missing chapters (e.g. `es-la`)
 - `--out <dir>` — Output directory (default: `./downloads`)
 
 ### Examples
