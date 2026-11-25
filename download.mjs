@@ -1,8 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { Zip, ZipPassThrough } from "fflate";
+import { PDFDocument } from "pdf-lib";
 
 const USER_AGENT = "mangades-cli/2.0";
+const VALID_FORMATS = new Set(["cbz", "pdf"]);
+const VALID_SPLITS = new Set(["volume", "chapter", "single"]);
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function extractMangaId(input) {
@@ -13,6 +17,62 @@ function extractMangaId(input) {
 
 function sanitize(name) {
   return name.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim();
+}
+
+function printUsage() {
+  console.log(`Usage: node download.mjs <mangadex-url-or-id> [lang] [output-dir] [options]
+
+Options:
+  --format <cbz|pdf>             Output format (default: cbz)
+  --split <volume|chapter|single> How to split files (default: volume)
+  --lang <code>                  Chapter language (default: en)
+  --out <dir>                    Output directory (default: ./downloads)
+  -h, --help                     Show this help message`);
+}
+
+function parseArgs(argv) {
+  const positional = [];
+  let format = "cbz";
+  let split = "volume";
+  let lang;
+  let outBase;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-h" || arg === "--help") {
+      printUsage();
+      process.exit(0);
+    } else if (arg === "--format") {
+      format = argv[++i]?.toLowerCase();
+    } else if (arg === "--split") {
+      split = argv[++i]?.toLowerCase();
+    } else if (arg === "--lang") {
+      lang = argv[++i];
+    } else if (arg === "--out") {
+      outBase = argv[++i];
+    } else if (arg.startsWith("-")) {
+      throw new Error(`Unknown option: ${arg}`);
+    } else {
+      positional.push(arg);
+    }
+  }
+
+  const mangaId = extractMangaId(positional[0]);
+  lang = lang || positional[1] || "en";
+  outBase = outBase || positional[2] || path.join(process.cwd(), "downloads");
+
+  if (!mangaId) {
+    printUsage();
+    process.exit(1);
+  }
+  if (!VALID_FORMATS.has(format)) {
+    throw new Error(`Invalid --format "${format}". Expected: cbz, pdf`);
+  }
+  if (!VALID_SPLITS.has(split)) {
+    throw new Error(`Invalid --split "${split}". Expected: volume, chapter, single`);
+  }
+
+  return { mangaId, lang, outBase, format, split };
 }
 
 async function fetchWithRetry(url, retries = 6, baseDelay = 1000) {
@@ -96,7 +156,79 @@ async function getAllChapters(mangaId, lang) {
   return chapters.filter((c) => !c.attributes.externalUrl && c.attributes.pages > 0);
 }
 
-async function writeVolumeCbz({ chapters, coverUrl, outFile }) {
+function groupChapters(chapters, split, covers) {
+  const sorted = [...chapters].sort(
+    (a, b) => Number(a.attributes.chapter || 0) - Number(b.attributes.chapter || 0)
+  );
+
+  if (split === "single") {
+    return [
+      {
+        label: "all",
+        chapters: sorted,
+        coverUrl: covers.values().next().value || null,
+      },
+    ];
+  }
+
+  if (split === "chapter") {
+    const chPad = Math.max(3, ...sorted.map((c) => String(c.attributes.chapter || "0").length));
+    return sorted.map((ch) => {
+      const vol = ch.attributes.volume || "0";
+      const chNum = String(ch.attributes.chapter || "0").padStart(chPad, "0");
+      return {
+        label: `ch ${chNum}`,
+        chapters: [ch],
+        coverUrl: covers.get(vol) || null,
+      };
+    });
+  }
+
+  // Default: split by volume
+  const byVol = new Map();
+  for (const ch of sorted) {
+    const vol = ch.attributes.volume || "0";
+    if (!byVol.has(vol)) byVol.set(vol, []);
+    byVol.get(vol).push(ch);
+  }
+
+  return [...byVol.keys()]
+    .sort((a, b) => Number(a) - Number(b))
+    .map((vol) => ({
+      label: vol === "0" ? "no-vol" : `vol ${String(vol).padStart(2, "0")}`,
+      chapters: byVol.get(vol),
+      coverUrl: covers.get(vol) || null,
+    }));
+}
+
+async function iterChapterImages(chapters, onImage) {
+  const chPad = Math.max(3, ...chapters.map((c) => String(c.attributes.chapter || "0").length));
+  for (const ch of chapters) {
+    await sleep(400);
+    const atHome = await fetchJson(`https://api.mangadex.org/at-home/server/${ch.id}`);
+    const files = atHome.chapter.data;
+    const baseUrl = atHome.baseUrl;
+    const hash = atHome.chapter.hash;
+
+    const chNum = String(ch.attributes.chapter || "0").padStart(chPad, "0");
+    const chTitle = ch.attributes.title ? ` - ${sanitize(ch.attributes.title)}` : "";
+    const chDir = `ch ${chNum}${chTitle}`;
+    const pagePad = String(files.length).length;
+
+    for (let i = 0; i < files.length; i++) {
+      const fname = files[i];
+      const ext = path.extname(fname) || ".jpg";
+      const imgUrl = `${baseUrl}/data/${hash}/${fname}`;
+      const res = await fetchWithRetry(imgUrl);
+      const buf = new Uint8Array(await res.arrayBuffer());
+      const pageName = `${chDir}/page ${String(i + 1).padStart(pagePad, "0")}${ext}`;
+      await onImage({ buf, ext, pageName });
+    }
+    console.log(`    ch ${ch.attributes.chapter} (${files.length} pages)`);
+  }
+}
+
+async function writeCbz({ chapters, coverUrl, outFile }) {
   const tmpFile = outFile + ".tmp";
   await new Promise((resolve, reject) => {
     const outStream = fs.createWriteStream(tmpFile);
@@ -123,32 +255,12 @@ async function writeVolumeCbz({ chapters, coverUrl, outFile }) {
           entry.push(buf, true);
         }
 
-        const chPad = Math.max(3, ...chapters.map((c) => String(c.attributes.chapter || "0").length));
-        for (const ch of chapters) {
-          await sleep(400);
-          const atHome = await fetchJson(`https://api.mangadex.org/at-home/server/${ch.id}`);
-          const files = atHome.chapter.data;
-          const baseUrl = atHome.baseUrl;
-          const hash = atHome.chapter.hash;
+        await iterChapterImages(chapters, ({ buf, pageName }) => {
+          const entry = new ZipPassThrough(pageName);
+          zip.add(entry);
+          entry.push(buf, true);
+        });
 
-          const chNum = String(ch.attributes.chapter || "0").padStart(chPad, "0");
-          const chTitle = ch.attributes.title ? ` - ${sanitize(ch.attributes.title)}` : "";
-          const chDir = `ch ${chNum}${chTitle}`;
-          const pagePad = String(files.length).length;
-
-          for (let i = 0; i < files.length; i++) {
-            const fname = files[i];
-            const ext = path.extname(fname) || ".jpg";
-            const imgUrl = `${baseUrl}/data/${hash}/${fname}`;
-            const res = await fetchWithRetry(imgUrl);
-            const buf = new Uint8Array(await res.arrayBuffer());
-            const pageName = `${chDir}/page ${String(i + 1).padStart(pagePad, "0")}${ext}`;
-            const entry = new ZipPassThrough(pageName);
-            zip.add(entry);
-            entry.push(buf, true);
-          }
-          console.log(`    ch ${ch.attributes.chapter} (${files.length} pages)`);
-        }
         zip.end();
       } catch (err) {
         outStream.destroy(err);
@@ -160,16 +272,45 @@ async function writeVolumeCbz({ chapters, coverUrl, outFile }) {
   fs.renameSync(tmpFile, outFile);
 }
 
-async function main() {
-  const mangaId = extractMangaId(process.argv[2]);
-  if (!mangaId) {
-    console.error("Usage: node download.mjs <mangadex-url-or-id> [lang] [output-dir]");
-    process.exit(1);
+async function embedImage(pdfDoc, buf) {
+  // Detect PNG (89 50 4E 47) or JPEG (FF D8 FF) by magic bytes
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return pdfDoc.embedPng(buf);
   }
-  const lang = process.argv[3] || "en";
-  const outBase = process.argv[4] || path.join(process.cwd(), "downloads");
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return pdfDoc.embedJpg(buf);
+  }
+  throw new Error("Unsupported image format for PDF (only PNG and JPEG are supported; use --format cbz for WebP)");
+}
 
-  console.log(`Fetching manga ${mangaId} (${lang})...`);
+async function writePdf({ chapters, coverUrl, outFile }) {
+  const tmpFile = outFile + ".tmp";
+  const pdfDoc = await PDFDocument.create();
+
+  const addPageFromBuf = async (buf) => {
+    const img = await embedImage(pdfDoc, buf);
+    const page = pdfDoc.addPage([img.width, img.height]);
+    page.drawImage(img, { x: 0, y: 0, width: img.width, height: img.height });
+  };
+
+  if (coverUrl) {
+    const res = await fetchWithRetry(coverUrl);
+    await addPageFromBuf(new Uint8Array(await res.arrayBuffer()));
+  }
+
+  await iterChapterImages(chapters, async ({ buf }) => {
+    await addPageFromBuf(buf);
+  });
+
+  const pdfBytes = await pdfDoc.save();
+  fs.writeFileSync(tmpFile, pdfBytes);
+  fs.renameSync(tmpFile, outFile);
+}
+
+async function main() {
+  const { mangaId, lang, outBase, format, split } = parseArgs(process.argv.slice(2));
+
+  console.log(`Fetching manga ${mangaId} (${lang}, format=${format}, split=${split})...`);
   const { title } = await getMangaInfo(mangaId, lang);
   const outDir = path.join(outBase, title);
   fs.mkdirSync(outDir, { recursive: true });
@@ -182,39 +323,30 @@ async function main() {
   ]);
   console.log(`Found ${chapters.length} downloadable chapters and ${covers.size} covers.`);
 
-  const byVol = new Map();
-  for (const ch of chapters) {
-    const vol = ch.attributes.volume || "0";
-    if (!byVol.has(vol)) byVol.set(vol, []);
-    byVol.get(vol).push(ch);
-  }
+  const groups = groupChapters(chapters, split, covers);
+  console.log(`Grouped into ${groups.length} ${split} file(s).`);
 
-  const volumes = [...byVol.keys()].sort((a, b) => Number(a) - Number(b));
-  console.log(`Grouped into ${volumes.length} volumes.`);
+  const writer = format === "pdf" ? writePdf : writeCbz;
 
-  for (const vol of volumes) {
-    const volChs = byVol.get(vol).sort(
-      (a, b) => Number(a.attributes.chapter || 0) - Number(b.attributes.chapter || 0)
-    );
-    const volLabel = vol === "0" ? "no-vol" : `vol ${String(vol).padStart(2, "0")}`;
-    const outFile = path.join(outDir, `${title} - ${volLabel}.cbz`);
+  for (const group of groups) {
+    const outFile = path.join(outDir, `${title} - ${group.label}.${format}`);
 
     if (fs.existsSync(outFile) && fs.statSync(outFile).size > 0) {
       console.log(`[SKIP] ${path.basename(outFile)} already exists.`);
       continue;
     }
 
-    console.log(`[DOWN] ${path.basename(outFile)} (${volChs.length} chapters)...`);
-    await writeVolumeCbz({
-      chapters: volChs,
-      coverUrl: covers.get(vol) || null,
+    console.log(`[DOWN] ${path.basename(outFile)} (${group.chapters.length} chapters)...`);
+    await writer({
+      chapters: group.chapters,
+      coverUrl: group.coverUrl,
       outFile,
     });
     const sizeMb = (fs.statSync(outFile).size / (1024 * 1024)).toFixed(1);
     console.log(`[DONE] ${path.basename(outFile)} (${sizeMb} MB)`);
   }
 
-  console.log("All volumes finished!");
+  console.log("All downloads finished!");
 }
 
 main().catch((err) => {
