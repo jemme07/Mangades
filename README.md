@@ -1,7 +1,27 @@
 # Mangades
 
-Mangadex viewer and downloader website, with read-only anilist integration.
+Minimal CLI to download MangaDex manga by volume as `.cbz` archives (with volume cover art).
 
-See it in action [here](https://manga.danbulant.eu).
+## Setup
 
-![image](https://github.com/user-attachments/assets/20a84993-b858-45ee-8f73-2f443ae77651)
+```bash
+npm install
+```
+
+## Usage
+
+```bash
+npm run download -- <mangadex-url-or-id> [lang] [output-dir]
+```
+
+Examples:
+
+```bash
+# Download all English volumes into ./downloads/
+npm run download -- https://mangadex.org/title/af0527c1-8734-4498-b128-7090340bc10d/dragon-ball
+
+# Specify language and custom output directory
+npm run download -- af0527c1-8734-4498-b128-7090340bc10d es-la ./my-manga
+```
+
+Existing non-empty `.cbz` files are skipped automatically, so interrupted runs can be resumed by re-running the same command.
